@@ -1,0 +1,146 @@
+CS 214 Project I: My little malloc()
+
+Authors
+-------
+<Partner 1 Name>  (NETID1)
+<Partner 2 Name>  (NETID2)
+
+Building and running
+--------------------
+    make            build everything (memgrind, memtest, correct, errors)
+    ./memgrind      stress test, reports average workload time
+    make test       run every correctness/error test and memgrind
+    make clean      remove object files and executables
+
+Design notes
+------------
+* The heap is a static 4096-byte (MEMLENGTH) array wrapped in a union with
+  a double to guarantee 8-byte alignment. MEMLENGTH may be overridden at
+  compile time (e.g. -DMEMLENGTH=8192).
+* Every chunk starts with an 8-byte header: an int holding the total chunk
+  size (header + payload) and an int allocated flag. Chunks are contiguous,
+  so the next chunk is at (header address + size): an implicit linked list
+  starting at the beginning of the array. No explicit pointers are stored.
+* Request sizes are rounded up to a multiple of 8 with (n + 7) & ~7, so
+  every chunk and payload is a multiple of 8 and every returned pointer is
+  8-byte aligned. Minimum chunk size is 16 bytes.
+* malloc() uses first fit. If the chosen chunk has at least 16 bytes left
+  over, it is split and the remainder stays free; otherwise the whole chunk
+  is handed out (the extra bytes are padding).
+* malloc(0), and any request larger than MEMLENGTH - 8, fail with the
+  standard "Unable to allocate" message and return NULL.
+* free() walks the chunk list from the start, tracking the previous chunk.
+  It only accepts a pointer that exactly equals the payload address of an
+  allocated chunk. Anything else -- a pointer outside the heap, a pointer
+  into the middle of a chunk, or a pointer to an already-free chunk -- is
+  reported as "free: Inappropriate pointer (file:line)" and the process
+  exits with status 2. The walk compares pointers only for equality, so
+  pointers outside the heap are handled without undefined behavior.
+* free(NULL) does nothing, matching the standard free(). This lets client
+  code safely free the result of a failed malloc().
+* free() coalesces the freed chunk with a free successor and a free
+  predecessor, so two adjacent free chunks never exist.
+* Initialization is lazy: the first call to malloc() or free() sets up a
+  single free chunk spanning the heap and registers the leak checker with
+  atexit(). A single static int records whether this has happened.
+* The leak checker counts allocated chunks at exit and prints
+  "mymalloc: N bytes leaked in M objects." to stderr. N counts payload bytes
+  (including alignment padding) but not headers. It never calls exit().
+
+Test plan
+---------
+For each requirement we state how a violation would show up, and which
+test checks it.
+
+1. malloc() reserves unallocated memory (objects don't overlap).
+   Detection: fill each object with a distinct byte, then check that
+   every object still holds its own byte.
+   Tests: memtest (64 objects filling the heap exactly), correct
+   "allocated objects do not overlap".
+
+2. Returned pointers are 8-byte aligned.
+   Detection: pointer value % 8 != 0 for any request size.
+   Test: correct "payloads are 8-byte aligned" (sizes 1, 4, 7, ... 28).
+
+3. free() deallocates memory.
+   Detection: if free() leaked chunks, repeatedly allocating the entire
+   heap would fail after the first time.
+   Test: correct "free() deallocates memory for reuse" (100 rounds of
+   allocating and freeing a 4088-byte object).
+
+4. Adjacent free chunks are coalesced.
+   Detection: after filling the heap with small chunks and freeing them
+   all (in a non-sequential order), a single heap-sized allocation fails
+   if any neighbors were not merged.
+   Tests: correct "adjacent free chunks are coalesced"; memgrind task 4.
+
+5. malloc() returns NULL and reports an error when it can't fit a request.
+   Detection: a request that can't fit returns non-NULL, or no message is
+   printed.
+   Test: correct "malloc() returns NULL when out of memory" (a 4096-byte
+   request, and a second 2048-byte request when only 2032 bytes are left).
+
+6. The allocator never touches allocated payloads.
+   Detection: an object's contents change while other objects are
+   allocated and freed around it.
+   Test: correct "object data unchanged by other allocations".
+
+7. free() detects bad pointers and exits with status 2.
+   Detection: the error message is missing or the exit status isn't 2.
+   Test: errors 1 (address of a local variable), errors 2 (pointer into
+   the middle of a chunk), errors 3 (double free). "make test" checks
+   that each exits with status 2.
+
+8. Leaks are reported at exit.
+   Detection: the expected leak message is missing.
+   Test: errors 4 leaks malloc(20) and malloc(100) (24 + 104 bytes after
+   rounding); "make test" checks for "128 bytes leaked in 2 objects".
+
+9. free(NULL) is accepted and does nothing, as with the standard free().
+   Detection: the program reports an error or exits with status 2.
+   Test: errors 5; "make test" checks that it exits with status 0.
+
+10. Client code works unchanged with or without mymalloc.h.
+   Detection: memtest fails to build or run with the real malloc().
+   Test: "make test" compiles memtest with -DREALMALLOC and runs it.
+
+11. The library holds up under a large number of operations.
+   Test: memgrind (below). Any corruption would show up as a failed
+   malloc, a spurious "Inappropriate pointer" error, or a leak report.
+
+Test programs
+-------------
+memtest      Provided sample client. Fills the heap with 64 objects of 56
+             bytes, checks the contents, frees them. No arguments.
+
+correct      Runs the correctness tests above, printing PASS/FAIL for each.
+             Exits 0 if all pass. No arguments. The two
+             "Unable to allocate" messages it prints are expected.
+
+errors N     Triggers one error case:
+               1  free() an address not from malloc()
+               2  free() a pointer not at the start of a chunk
+               3  free() the same pointer twice
+               4  leak two objects (leak report at exit, exit status 0)
+               5  free(NULL), which must be a harmless no-op (exit status 0)
+             Cases 1-3 should print "free: Inappropriate pointer" and exit
+             with status 2. (Case 2 also prints a leak report, since the
+             chunk is still allocated when the process exits.)
+
+memgrind     Records the start time with gettimeofday(), runs the workload of
+             five tasks 50 times, records the end time, and prints the
+             average time per workload (elapsed time / 50). No arguments.
+               Task 1: allocate 8, 16, 32, 64, 128, 512, 1024 bytes, free
+                       them in reverse order.
+               Task 2: allocate 120 1-byte objects, free them in order.
+               Task 3: randomly choose between allocating a 1-byte object
+                       and freeing a random live one, until 120 allocations
+                       have been made, then free the rest.
+               Task 4: allocate 120 8-byte objects, free the odd indices,
+                       then the even ones (each even free must coalesce
+                       with both neighbors), then allocate and free a
+                       2048-byte object, which only fits if coalescing
+                       worked.
+               Task 5: build a 60-node linked list, delete every other node,
+                       insert new nodes of varying sizes into the gaps, then
+                       free the whole list from the front.

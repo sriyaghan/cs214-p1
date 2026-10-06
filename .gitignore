@@ -1,0 +1,8 @@
+*.o
+*.dSYM/
+memgrind
+memtest
+memtest_real
+correct
+errors
+*.tar
